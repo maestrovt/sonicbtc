@@ -2,6 +2,8 @@ from decimal import Decimal
 from ecdsa import SigningKey, SECP256k1
 from subprocess import run
 from typing import List, Tuple
+from datetime import datetime
+from note import Note
 import hashlib
 import hmac
 import json
@@ -9,6 +11,10 @@ import json
 # Provided by administrator
 WALLET_NAME = "wallet_171"
 EXTENDED_PRIVATE_KEY = "tprv8ZgxMBicQKsPdyeZaFF6JRjdJ24oy7dC9FvYrtaqTrhhRbs9vXMCMwsFn95Gg7rhkHwX5piq66LN69iJfxBWFtL5tQAdm4atSq5eBHP7nZT"
+Full_STR_Pizzicato = Note()
+# Log function to output progress
+def log(msg):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 # Decode a base58 string into an array of bytes
 def base58_decode(base58_string: str) -> bytes:
@@ -175,9 +181,22 @@ def recover_wallet_state(tprv: str):
     }
 
     # Scan blocks 0-300
-    height = 300
-    for h in range(height + 1):
+    height = 120
+    pizz_duration = 0.2
+    pizz_channel = 0
+    pizz_cc = 10
+    pizz_cc_value = 64
+    for h in range(90, height + 1):
         block_hash = bcli(f"getblockhash {h}")
+        log(f"Scanning block {h}")
+        if (h % 5) == 0:
+            pizz_vel = 120
+            pizz_pitch = 36
+        else:
+            pizz_vel = 40
+            pizz_pitch = 24
+        log(f"Pizz Velocity: {pizz_vel}, Pizz. Pitch: {pizz_pitch}")
+        Full_STR_Pizzicato.play(pizz_pitch, pizz_duration, pizz_channel, pizz_vel, pizz_cc, pizz_cc_value)
         block = json.loads(bcli(f"getblock {block_hash} 2"), parse_float=Decimal)
         txs = block["tx"]
 
@@ -193,12 +212,14 @@ def recover_wallet_state(tprv: str):
                         for pub in pubs:
                             if pubkey == pub.hex():
                                 outpoint = f"{inp['txid']}:{inp['vout']}"
+                                log(f"Found matching pubkey {pubkey} and outpoint {outpoint}")
                                 if outpoint in state["utxo"]:
+                                    # Remove this coin from our wallet state utxo pool
+                                    # so we don't double spend it later
+                                    log(f"utxo found with value {state["utxo"][outpoint]["value"]}")
                                     state["balance"] -= state["utxo"][outpoint]["value"]
                                     del state["utxo"][outpoint]
-
-                    # Remove this coin from our wallet state utxo pool
-                    # so we don't double spend it later
+                                log(f"Updated balance: {state['balance']}")
 
             # Check every tx output for our own witness programs.
             # These are coins we have received.
@@ -208,16 +229,18 @@ def recover_wallet_state(tprv: str):
                 if "hex" in script_pub_key:
                     program = bytes.fromhex(script_pub_key["hex"])
                     if program in programs:
+                        log(f"Found matching witness program {script_pub_key["hex"]}, output {out['n']}, value {Decimal(out["value"])} BTC")
                         outpoint = f"{tx['txid']}:{out['n']}"
                         program_index = programs.index(program)
+                        # Keep track of this UTXO by its outpoint in case we spend it later
                         state["utxo"][outpoint] = {
                             "value": Decimal(out["value"]),
                             "program_index": program_index # Store the program index
                         }
 
                         state["balance"] += Decimal(out["value"])
+                        log(f"Updated balance: {state['balance']}")
 
-                    # Keep track of this UTXO by its outpoint in case we spend it later
 
     return state
 
