@@ -2,7 +2,6 @@ from decimal import Decimal
 from ecdsa import SigningKey, SECP256k1
 from subprocess import run
 from typing import List, Tuple
-from datetime import datetime
 from note import Note
 import hashlib
 import hmac
@@ -10,63 +9,26 @@ import json
 import threading
 import queue
 import time
-from dataclasses import dataclass
 from collections import deque
+from constants import OVERTONES
+from data import (
+    MidiTask,
+    BlockScanned,
+    UTXOReceived,
+    BalanceUpdated,
+    UTXOSpent,
+    SENTINEL
+)
+from sonify import _pitch_from_balance
+from utilities import log
+from player import send_note_via_mido, metronome
 
 
 # Provided by administrator
 WALLET_NAME = "wallet_171"
 EXTENDED_PRIVATE_KEY = "tprv8ZgxMBicQKsPdyeZaFF6JRjdJ24oy7dC9FvYrtaqTrhhRbs9vXMCMwsFn95Gg7rhkHwX5piq66LN69iJfxBWFtL5tQAdm4atSq5eBHP7nZT"
-Full_STR_Pizzicato = Note()
 
-@dataclass
-class MidiTask:
-    pitch: int
-    velocity: int = 96
-    duration_ms: int = 120  # Note.play() expects seconds; we’ll convert
-
-SENTINEL = object()  # put on the queue to signal “producer is done”
-
-# reuse your global Note helper if you already created one:
-# Full_STR_Pizzicato = Note()  # you already have this in your file
-
-def send_note_via_mido(task: MidiTask) -> None:
-    """
-    Use your existing Note.play() to send via 'Logic Pro Virtual In'.
-    Adjust channel/CC as you like.
-    """
-    note = Full_STR_Pizzicato  # or Note() if you prefer a fresh wrapper each time
-    note.play(
-        pitch=task.pitch,
-        duration=task.duration_ms / 1000.0,  # convert ms -> seconds
-        channel=0,
-        velocity=task.velocity,
-        cc=64,
-        cc_value=0,
-    )
-
-
-
-def metronome(duration, meter, bars):
-    pizz_duration = duration
-    pizz_channel = 0
-    pizz_cc = 10
-    pizz_cc_value = 64
-
-    for h in range(0, bars):
-        if (h % meter) == 0:
-                pizz_vel = 120
-                pizz_pitch = 36
-        else:
-                pizz_vel = 40
-                pizz_pitch = 24
-        log(f"Pizz Velocity: {pizz_vel}, Pizz. Pitch: {pizz_pitch}, Bar: {h}")
-        Full_STR_Pizzicato.play(pizz_pitch, pizz_duration, pizz_channel, pizz_vel, pizz_cc, pizz_cc_value)
-
-
-# Log function to output progress
-def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+_LAST_BALANCE_PITCH: int | None = None
 
 # Decode a base58 string into an array of bytes
 def base58_decode(base58_string: str) -> bytes:
@@ -211,7 +173,8 @@ def bcli(cmd: str):
 # - Parse tprv and path from descriptor and derive 2000 key pairs and witness programs
 # - Request blocks 0-310 from Bitcoin Core via RPC and scan all transactions
 # - Return a state object with all the derived keys and total wallet balance
-def recover_wallet_state(tprv: str):
+def recover_wallet_state(tprv: str, on_event=None) -> dict:
+    emit = on_event or (lambda _e: None)
     decoded = base58_decode(tprv)
     key_data = deserialize_key(decoded)
     master_private_key = key_data["key"]
@@ -233,10 +196,11 @@ def recover_wallet_state(tprv: str):
     }
 
     # Scan blocks 0-300
-    height = 300
+    height = 150
     for h in range(height + 1):
+        emit(BlockScanned(height=h))  # <--- stream progress
         block_hash = bcli(f"getblockhash {h}")
-        log(f"Scanning block {h}")
+        # log(f"Scanning block {h}")
         
         block = json.loads(bcli(f"getblock {block_hash} 2"), parse_float=Decimal)
         txs = block["tx"]
@@ -253,14 +217,17 @@ def recover_wallet_state(tprv: str):
                         for pub in pubs:
                             if pubkey == pub.hex():
                                 outpoint = f"{inp['txid']}:{inp['vout']}"
-                                log(f"Found matching pubkey {pubkey} and outpoint {outpoint}")
+                                # log(f"Found matching pubkey {pubkey} and outpoint {outpoint}")
                                 if outpoint in state["utxo"]:
                                     # Remove this coin from our wallet state utxo pool
                                     # so we don't double spend it later
-                                    log(f"utxo found with value {state["utxo"][outpoint]["value"]}")
+                                    spent_value = state["utxo"][outpoint]["value"]
+                                    emit(UTXOSpent(outpoint=outpoint, value=spent_value))
+                                    # log(f"utxo found with value {spent_value}")
                                     state["balance"] -= state["utxo"][outpoint]["value"]
                                     del state["utxo"][outpoint]
-                                log(f"Updated balance: {state['balance']}")
+                                    emit(BalanceUpdated(balance=state["balance"]))
+                                    # log(f"Updated balance: {state['balance']}")
 
             # Check every tx output for our own witness programs.
             # These are coins we have received.
@@ -270,7 +237,7 @@ def recover_wallet_state(tprv: str):
                 if "hex" in script_pub_key:
                     program = bytes.fromhex(script_pub_key["hex"])
                     if program in programs:
-                        log(f"Found matching witness program {script_pub_key["hex"]}, output {out['n']}, value {Decimal(out["value"])} BTC")
+                        # log(f"Found matching witness program {script_pub_key["hex"]}, output {out['n']}, value {Decimal(out["value"])} BTC")
                         outpoint = f"{tx['txid']}:{out['n']}"
                         program_index = programs.index(program)
                         # Keep track of this UTXO by its outpoint in case we spend it later
@@ -278,39 +245,61 @@ def recover_wallet_state(tprv: str):
                             "value": Decimal(out["value"]),
                             "program_index": program_index # Store the program index
                         }
-
-                        state["balance"] += Decimal(out["value"])
-                        log(f"Updated balance: {state['balance']}")
+                        val = Decimal(out["value"])
+                        state["balance"] += val
+                        emit(UTXOReceived(outpoint=outpoint, value=val, program_index=program_index))
+                        emit(BalanceUpdated(balance=state["balance"]))
+                        # log(f"Updated balance: {state['balance']}")
 
 
     return state
 
-def recover_and_feed(ext_privkey: str, out_q: "queue.Queue[object]") -> None:
-    """
-    Producer: call recover_wallet_state(), extract values, enqueue MidiTask items.
-    Always puts SENTINEL when finished (even on error).
-    """
+
+def recover_and_feed_streaming(xprv: str, out_q: "queue.Queue[object]") -> None:
     try:
-        state = recover_wallet_state(ext_privkey)
-        # Example extraction:
-        # Expecting state like {"balance": Decimal(...), "utxo": {outpoint: {"value": Decimal(...)}, ...}, ...}
-        utxos = state.get("utxo", {})
-
-        # Map each UTXO value to a pitch. You can make this smarter later.
-        for _, info in utxos.items():
-            val = info.get("value", Decimal(0))
-            # Convert BTC Decimal -> sats int (guard against non-Decimal)
-            sats = int((val if isinstance(val, Decimal) else Decimal(val)) * Decimal(100_000_000))
-            # Simple pitch map: C2..B5 (48 semitones) offset from 36
-            pitch = 36 + (sats % 48)
-            out_q.put(MidiTask(pitch=pitch, velocity=96, duration_ms=120))
-
-        # You can enqueue more derived events here:
-        # - one note per tx count bucket
-        # - special accents for change outputs, script types, etc.
-
+        def on_event(ev):  # called *within* recover_wallet_state loops
+            out_q.put(ev)
+        recover_wallet_state(xprv, on_event=on_event)
     finally:
         out_q.put(SENTINEL)
+
+
+def event_to_tasks(ev) -> list[MidiTask]:
+    global _LAST_BALANCE_PITCH
+    # --- simple, musical defaults you can tweak freely ---
+    if isinstance(ev, BlockScanned):
+        # Encode block height as an overtone over four octaves starting at C0
+        # Move to next overtone every 20 blocks
+        # Only sound every 5 blocks
+        if ev.height % 5 == 0:
+            pitch = 24
+            for i in range(0, ev.height // 20):
+                pitch += OVERTONES[i]
+            log(f"Block height: {ev.height}, Pitch: {pitch}")
+            return [MidiTask(pitch, velocity=50, duration_ms=140, channel=1, controller=10, controller_value=40)]
+        return []
+    if isinstance(ev, UTXOReceived):
+        # Larger values → higher velocity; program_index nudges pitch
+        sats = int(ev.value * Decimal(100_000_000))
+        vel = 60 + min(67, sats // 1_000_000)          # cap at ~127
+        pitch = 60 + (ev.program_index % 24)           # map script variant
+        log(f"UTXO Received: {ev.value} BTC, Program index: {ev.program_index}, Pitch: {pitch}")
+        return [MidiTask(pitch=pitch, velocity=vel, duration_ms=140, channel=2, controller=10, controller_value=64)]
+    if isinstance(ev, UTXOSpent):
+        # A softer “down” motif for spends
+        pitch = 36 + (hash(ev.outpoint) % 12)          # deterministic but varied
+        log(f"UTXO Spent Outpoint: {ev.outpoint}, Pitch: {pitch}")
+        return [MidiTask(pitch=pitch, velocity=50, duration_ms=100, channel=0, controller=10, controller_value=100)]
+    if isinstance(ev, BalanceUpdated):
+        new_pitch = _pitch_from_balance(ev.balance)
+        log(f"Wallet balance upated to: {ev.balance} BTC, calculated pitch: {new_pitch}")
+        if _LAST_BALANCE_PITCH is not None and new_pitch == _LAST_BALANCE_PITCH:
+            return []  # ignore small/no-op changes that map to the same note
+
+        _LAST_BALANCE_PITCH = new_pitch
+        
+        return [MidiTask(pitch=new_pitch, velocity=64, duration_ms=120, channel=3, controller=10, controller_value=80)]
+    return []  # unknown events → silent
 
 def metronome_scheduler(
     tick_seconds: float,
@@ -319,16 +308,12 @@ def metronome_scheduler(
     max_notes_per_tick: int = 1,
     stop_when_empty: bool = True,
 ) -> None:
-    """
-    Consumer: every tick, pop up to max_notes_per_tick items from the queue and play them.
-    Exits when producer is finished (SENTINEL seen) AND the queue is fully drained.
-    """
     pending = deque()
     producer_done = False
     next_deadline = time.monotonic()
 
     while True:
-        # Harvest anything currently available without blocking timing
+        # Pull all currently available events and expand them to tasks
         while True:
             try:
                 item = inbox.get_nowait()
@@ -337,35 +322,24 @@ def metronome_scheduler(
             if item is SENTINEL:
                 producer_done = True
             else:
-                pending.append(item)
+                pending.extend(event_to_tasks(item))
 
-        # Play up to K items this tick
+        # Play up to K tasks this tick
         for _ in range(min(max_notes_per_tick, len(pending))):
-            task = pending.popleft()
-            send_note_fn(task)
+            send_note_fn(pending.popleft())
 
-        # Exit once the producer is done and we’ve drained everything
+        # Exit when producer is done and every task is drained
         if stop_when_empty and producer_done and not pending and inbox.empty():
             break
 
-        # Drift-resistant sleep to the next grid point
+        # Drift-resistant sleep
         next_deadline += tick_seconds
-        remaining = next_deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
+        remain = next_deadline - time.monotonic()
+        if remain > 0:
+            time.sleep(remain)
         else:
-            # If we slipped behind, resync to 'now'
             next_deadline = time.monotonic()
 
-
-
-# if __name__ == "__main__":
-    
-#        thread1 = threading.Thread(target=metronome, args=(0.2, 5, 100))
-#        thread2 = threading.Thread(target=recover_wallet_state, args =(EXTENDED_PRIVATE_KEY,), daemon=True)
-#        thread1.start()
-#        thread2.start()
-#        thread2.join()
 
 if __name__ == "__main__":
     # Use the same period you pass to your click-track metronome, e.g. 0.2s (≈120 BPM, 8th-note grid)
@@ -375,7 +349,7 @@ if __name__ == "__main__":
 
     # 1) Producer: recover and enqueue tasks
     t_producer = threading.Thread(
-        target=recover_and_feed,
+        target=recover_and_feed_streaming,
         args=(EXTENDED_PRIVATE_KEY, inbox),
         daemon=True,  # producer can be daemon — we gate shutdown via the consumer
         name="recover-producer",
@@ -384,7 +358,7 @@ if __name__ == "__main__":
     # 2) Optional: keep your existing audible click running independently
     t_click = threading.Thread(
         target=metronome,
-        args=(TICK_SECONDS, 5, 100),   # your existing signature (period, count, velocity)
+        args=(TICK_SECONDS, 5, 1),   # your existing signature (period, count, velocity)
         daemon=True,                   # don't block program exit
         name="click-track",
     )
@@ -399,7 +373,7 @@ if __name__ == "__main__":
     )
 
     t_producer.start()
-    t_click.start()
+    # t_click.start()
     t_player.start()
 
     # Wait until everything queued has been played

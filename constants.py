@@ -23,3 +23,8 @@ MAJOR_SCALES = [
     B_Flat_MAJOR,
     F_MAJOR
 ]
+OVERTONES = [12, 7, 5, 4, 3, 3, 2, 2, 2, 1, 2, 1, 2, 1, 1]
+TODI_THAAT = [1, 2, 3, 1, 1, 3, 1]
+TODI_SPANS  = [1/12, 1/6, 1/4, 1/12, 1/4, 1/12]
+
+BASE_BALANCE_PITCH = 48
